@@ -1,0 +1,7 @@
+[sncast.sepolia]
+url = "https://starknet-sepolia.public.blastapi.io/rpc/v0_8"
+chain_id = "SN_SEPOLIA"
+account = "sepolia"
+wait-params = { timeout = 300, retry-interval = 10 }
+block-explorer = "StarkScan"
+show-explorer-links = true

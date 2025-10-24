@@ -1,0 +1,11 @@
+mod IERC20;
+mod IMintable;
+mod ISwapper;
+mod IBitcoinHeaders;
+mod IBitcoinClient;
+mod IBitcoinUtils;
+mod ICryptoUtils;
+mod IBTCDepositManager;
+mod IBTCPegOut;
+mod IOperatorRegistry;
+mod IEscapeHatch;

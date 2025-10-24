@@ -1,0 +1,9 @@
+{
+  "alpha-sepolia": {
+    "deployer": {
+      "private_key": "0x1",
+      "public_key": "0x5335a6fe120bf47e0215d436ad7ef923d9d25ad356f5538becbcc8c5cd297c9",
+      "address": "0x7f55e6e661b0d978818d95ffd5a22ef759e9bb45c8d72a12f7b6ff6bfffb044"
+    }
+  }
+}

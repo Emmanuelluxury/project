@@ -1,0 +1,15 @@
+[package]
+name = "starknet_bridge"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+starknet = "2.11.4"
+
+[[target.starknet-contract]]
+
+[lib]
+sierra = true
+casm = true
+name = "starknet_bridge"
+path = "src/lib.cairo"
