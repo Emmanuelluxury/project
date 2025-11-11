@@ -81,7 +81,18 @@ pub mod Bridge {
         user_transaction_count: Map<ContractAddress, u32>, // user -> transaction count
         user_transactions: Map<(ContractAddress, u32), TransactionRecord>, // (user, index) -> transaction record
 
-
+        // External contract addresses for operations
+        lock_address: ContractAddress,
+        unlock_address: ContractAddress,
+        receive_cross_chain_address: ContractAddress,
+        bridge_btc_to_token_address: ContractAddress,
+        bridge_token_to_btc_address: ContractAddress,
+        swap_token_to_token_address: ContractAddress,
+        initiate_bitcoin_deposit_address: ContractAddress,
+        initiate_bitcoin_withdrawal_address: ContractAddress,
+        send_address: ContractAddress,
+        withdraw_address: ContractAddress,
+        deposit_address: ContractAddress,
 
         // Bridge-specific storage only
     }
@@ -180,6 +191,7 @@ pub mod Bridge {
         user: ContractAddress,
         amount: u256,
         btc_address: felt252,
+        timestamp: u64,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -190,6 +202,7 @@ pub mod Bridge {
         user: ContractAddress,
         amount: u256,
         btc_address: felt252,
+        timestamp: u64,
     }
 
 
@@ -267,6 +280,19 @@ pub mod Bridge {
         pub const HEADER_EXISTS: felt252 = 'Bridge: Header exists';
         pub const INVALID_PROOF: felt252 = 'Bridge: Invalid proof';
 
+        // External address errors
+        pub const INVALID_LOCK_ADDRESS: felt252 = 'Bridge: Invalid lock addr';
+        pub const INVALID_UNLOCK_ADDRESS: felt252 = 'Bridge: Invalid unlock addr';
+        pub const INVALID_RECEIVE_CROSS_CHAIN_ADDRESS: felt252 = 'Bridge: Invalid receive addr';
+        pub const INVALID_BRIDGE_BTC_TO_TOKEN_ADDRESS: felt252 = 'Bridge: Invalid btc-token addr';
+        pub const INVALID_BRIDGE_TOKEN_TO_BTC_ADDRESS: felt252 = 'Bridge: Invalid token-btc addr';
+        pub const INVALID_SWAP_TOKEN_TO_TOKEN_ADDRESS: felt252 = 'Bridge: Invalid swap addr';
+        pub const INVALID_INITIATE_BITCOIN_DEPOSIT_ADDRESS: felt252 = 'Bridge: Invalid deposit addr';
+        pub const INVALID_INITIATE_BITCOIN_WITHDRAWAL_ADDRESS: felt252 = 'Bridge: Invalid withdrawal addr';
+        pub const INVALID_SEND_ADDRESS: felt252 = 'Bridge: Invalid send addr';
+        pub const INVALID_WITHDRAW_ADDRESS: felt252 = 'Bridge: Invalid withdraw addr';
+        pub const INVALID_DEPOSIT_ADDRESS: felt252 = 'Bridge: Invalid deposit addr';
+
     }
 
     /// Custom error handling with descriptive messages
@@ -322,7 +348,7 @@ pub mod Bridge {
     /// Convert amount to string for validation (simplified)
     fn amount_to_string(amount: u256) -> felt252 {
         // Simplified conversion for validation purposes
-        amount.low.into()
+        amount.high.into()
     }
 
     /// Validate address is not zero
@@ -527,15 +553,50 @@ pub mod Bridge {
         ref self: ContractState,
         admin: ContractAddress,
         emergency_admin: ContractAddress,
-        daily_bridge_limit: u256
+        daily_bridge_limit: u256,
+        lock: ContractAddress,
+        unlock: ContractAddress,
+        receive_cross_chain: ContractAddress,
+        bridge_btc_to_token: ContractAddress,
+        bridge_token_to_btc: ContractAddress,
+        swap_token_to_token: ContractAddress,
+        initiate_bitcoin_deposit: ContractAddress,
+        initiate_bitcoin_withdrawal: ContractAddress,
+        send: ContractAddress,
+        withdraw: ContractAddress,
+        deposit: ContractAddress
     ) {
         // Validate inputs
         validate_address(admin, 'INVALID_ADMIN');
         validate_address(emergency_admin, 'INVALID_EMERGENCY_ADMIN');
+        validate_address(lock, Errors::INVALID_LOCK_ADDRESS);
+        validate_address(unlock, Errors::INVALID_UNLOCK_ADDRESS);
+        validate_address(receive_cross_chain, Errors::INVALID_RECEIVE_CROSS_CHAIN_ADDRESS);
+        validate_address(bridge_btc_to_token, Errors::INVALID_BRIDGE_BTC_TO_TOKEN_ADDRESS);
+        validate_address(bridge_token_to_btc, Errors::INVALID_BRIDGE_TOKEN_TO_BTC_ADDRESS);
+        validate_address(swap_token_to_token, Errors::INVALID_SWAP_TOKEN_TO_TOKEN_ADDRESS);
+        validate_address(initiate_bitcoin_deposit, Errors::INVALID_INITIATE_BITCOIN_DEPOSIT_ADDRESS);
+        validate_address(initiate_bitcoin_withdrawal, Errors::INVALID_INITIATE_BITCOIN_WITHDRAWAL_ADDRESS);
+        validate_address(send, Errors::INVALID_SEND_ADDRESS);
+        validate_address(withdraw, Errors::INVALID_WITHDRAW_ADDRESS);
+        validate_address(deposit, Errors::INVALID_DEPOSIT_ADDRESS);
 
         // Initialize core admin addresses
         self.admin.write(admin);
         self.emergency_admin.write(emergency_admin);
+
+        // Initialize external contract addresses
+        self.lock_address.write(lock);
+        self.unlock_address.write(unlock);
+        self.receive_cross_chain_address.write(receive_cross_chain);
+        self.bridge_btc_to_token_address.write(bridge_btc_to_token);
+        self.bridge_token_to_btc_address.write(bridge_token_to_btc);
+        self.swap_token_to_token_address.write(swap_token_to_token);
+        self.initiate_bitcoin_deposit_address.write(initiate_bitcoin_deposit);
+        self.initiate_bitcoin_withdrawal_address.write(initiate_bitcoin_withdrawal);
+        self.send_address.write(send);
+        self.withdraw_address.write(withdraw);
+        self.deposit_address.write(deposit);
 
         // Bridge state - start unpaused
         self.bridge_paused.write(false);
@@ -771,6 +832,7 @@ pub mod Bridge {
             user: caller,
             amount,
             btc_address,
+            timestamp: starknet::get_block_timestamp(),
         }));
 
         let zero_address: ContractAddress = 0.try_into().unwrap();
@@ -835,6 +897,7 @@ pub mod Bridge {
             user: caller,
             amount: min_btc_out,
             btc_address,
+            timestamp: starknet::get_block_timestamp(),
         }));
 
         let zero_address: ContractAddress = 0.try_into().unwrap();
@@ -938,12 +1001,19 @@ pub mod Bridge {
         check_daily_limit(ref self, amount);
         update_daily_usage(ref self, amount);
 
+        let caller = get_caller_address();
+        let zero_address: ContractAddress = 0.try_into().unwrap();
+
         self.emit(Event::BitcoinDepositInitiated(BitcoinDepositInitiated {
             deposit_id,
-            user: get_caller_address(),
+            user: caller,
             amount,
             btc_address,
+            timestamp: starknet::get_block_timestamp(),
         }));
+
+        // Record transaction in history
+        record_transaction(ref self, caller, TransactionType::Deposit, zero_address, amount, 0, starknet_recipient.into(), btc_address, deposit_id);
 
         deposit_id
     }
@@ -968,12 +1038,19 @@ pub mod Bridge {
         check_daily_limit(ref self, amount);
         update_daily_usage(ref self, amount);
 
+        let caller = get_caller_address();
+        let zero_address: ContractAddress = 0.try_into().unwrap();
+
         self.emit(Event::BitcoinWithdrawalInitiated(BitcoinWithdrawalInitiated {
             withdrawal_id,
-            user: get_caller_address(),
+            user: caller,
             amount,
             btc_address,
+            timestamp: starknet::get_block_timestamp(),
         }));
+
+        // Record transaction in history
+        record_transaction(ref self, caller, TransactionType::Withdraw, zero_address, amount, 0, 0, btc_address, withdrawal_id);
 
         withdrawal_id
     }
@@ -1074,19 +1151,16 @@ pub mod Bridge {
         let max_count = if count > total_count { total_count } else { count };
 
         let mut i = 0;
-        while i < max_count {
+        while i != max_count {
             let index = if total_count > Constants::MAX_TRANSACTIONS_PER_USER {
-                // Handle circular buffer
-                let start_index = total_count - max_count;
-                start_index + i
+                // Handle circular buffer with wrap-around
+                (total_count - max_count + i) % Constants::MAX_TRANSACTIONS_PER_USER
             } else {
-                i
+                total_count - max_count + i
             };
 
-            if index < total_count {
-                let record = self.user_transactions.read((user, index));
-                transactions.append(record);
-            }
+            let record = self.user_transactions.read((user, index));
+            transactions.append(record);
             i += 1;
         };
 
