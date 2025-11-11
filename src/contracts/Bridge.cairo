@@ -129,6 +129,15 @@ pub mod Bridge {
     }
 
     #[derive(Drop, starknet::Event)]
+    struct Bridge {
+        #[key]
+        token: ContractAddress,
+        #[key]
+        to: ContractAddress,
+        amount: u256,
+    }
+
+    #[derive(Drop, starknet::Event)]
     struct Unlocked {
         #[key]
         token: ContractAddress,
