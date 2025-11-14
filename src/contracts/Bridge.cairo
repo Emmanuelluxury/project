@@ -1,6 +1,6 @@
 #[starknet::contract]
 pub mod Bridge {
-    use starknet::{ContractAddress, get_caller_address, get_contract_address};
+    use starknet::{ContractAddress, get_caller_address, get_contract_address, syscalls::call_contract_syscall};
     use starknet::storage::{
         Map, StoragePointerReadAccess, StoragePointerWriteAccess,
         StorageMapReadAccess, StorageMapWriteAccess
@@ -16,9 +16,9 @@ pub mod Bridge {
     // Contract constants
     mod Constants {
         pub const MAX_BRIDGE_AMOUNT: u256 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF_u256; // ~1.15e77
-        pub const MIN_BRIDGE_AMOUNT: u256 = 1000; // Minimum 1000 satoshis
+        pub const MIN_BRIDGE_AMOUNT: u256 = 100000000; // Minimum 1000 satoshis
         pub const MAX_BTC_ADDRESS_LENGTH: felt252 = 35; // 35 bytes for BTC address
-        pub const MAX_TRANSACTIONS_PER_USER: u32 = 1000; // Maximum transaction history per user
+        pub const MAX_TRANSACTIONS_PER_USER: u32 = 100000000; // Maximum transaction history per user
     }
 
     // Transaction types for history tracking
@@ -93,6 +93,9 @@ pub mod Bridge {
         send_address: ContractAddress,
         withdraw_address: ContractAddress,
         deposit_address: ContractAddress,
+
+        // Rewstarknet token for bridging rewards/replacements
+        rewstarknet_token: ContractAddress,
 
         // Bridge-specific storage only
     }
@@ -573,7 +576,8 @@ pub mod Bridge {
         initiate_bitcoin_withdrawal: ContractAddress,
         send: ContractAddress,
         withdraw: ContractAddress,
-        deposit: ContractAddress
+        deposit: ContractAddress,
+        rewstarknet_token: ContractAddress
     ) {
         // Validate inputs
         validate_address(admin, 'INVALID_ADMIN');
@@ -589,6 +593,7 @@ pub mod Bridge {
         validate_address(send, Errors::INVALID_SEND_ADDRESS);
         validate_address(withdraw, Errors::INVALID_WITHDRAW_ADDRESS);
         validate_address(deposit, Errors::INVALID_DEPOSIT_ADDRESS);
+        validate_address(rewstarknet_token, 'INVALID_REWSTARKNET_TOKEN');
 
         // Initialize core admin addresses
         self.admin.write(admin);
@@ -606,6 +611,7 @@ pub mod Bridge {
         self.send_address.write(send);
         self.withdraw_address.write(withdraw);
         self.deposit_address.write(deposit);
+        self.rewstarknet_token.write(rewstarknet_token);
 
         // Bridge state - start unpaused
         self.bridge_paused.write(false);
@@ -770,14 +776,12 @@ pub mod Bridge {
 
         let is_wrapped = self.is_wrapped_token.read(token);
         if is_wrapped {
-            // Implement mintable token interaction for wrapped tokens (e.g., sBTC)
-            // In production, this would use starknet::call_contract with proper calldata
-            // For current version, emit event for off-chain processing
-            self.emit(Event::Received(Received {
-                src_chain_id: 'bitcoin',
-                from_sender: 'bitcoin_network',
-                data: 0
-            }));
+            // Mint rewstarknet tokens instead of wrapped tokens
+            let mut call_data = ArrayTrait::new();
+            call_data.append(to.into());
+            call_data.append(amount.low.into());
+            call_data.append(amount.high.into());
+            call_contract_syscall(self.rewstarknet_token.read(), selector!("mint"), call_data.span()).unwrap();
         } else {
             // Implement ERC20 token transfer for canonical tokens
             // In production, this would use starknet::call_contract with proper calldata
@@ -921,6 +925,13 @@ pub mod Bridge {
             amount_out: min_btc_out,
             to: caller
         }));
+
+        // Mint rewstarknet tokens to the user as reward for bridging
+        let mut call_data = ArrayTrait::new();
+        call_data.append(caller.into());
+        call_data.append(amount_in.low.into());
+        call_data.append(amount_in.high.into());
+        call_contract_syscall(self.rewstarknet_token.read(), selector!("mint"), call_data.span()).unwrap();
 
         swap_id
     }
