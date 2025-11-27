@@ -5,6 +5,7 @@ pub mod Bridge {
         Map, StoragePointerReadAccess, StoragePointerWriteAccess,
         StorageMapReadAccess, StorageMapWriteAccess
     };
+    use starknet::SyscallResultTrait;
     
     use core::integer::u256;
     use core::traits::TryInto;
@@ -392,10 +393,10 @@ pub mod Bridge {
         let next_nonce = current_nonce + 1;
 
         // Check if nonce has already been used
-        ensure(!self.used_nonces.read(next_nonce.into()), 'NONCE_ALREADY_USED');
+        ensure(!self.used_nonces.read(next_nonce), 'NONCE_ALREADY_USED');
 
         // Mark nonce as used and increment user nonce
-        self.used_nonces.write(next_nonce.into(), true);
+        self.used_nonces.write(next_nonce, true);
         self.user_nonce.write(user, next_nonce);
     }
 
@@ -485,16 +486,7 @@ pub mod Bridge {
 
         // Convert felt252 to string-like validation (simplified for Cairo)
         // Check if the felt252 represents a valid Bitcoin address length when interpreted as u32
-        let addr_len_result = btc_address.try_into();
-        let addr_len: u32 = match addr_len_result {
-            Option::Some(len) => len,
-            Option::None => {
-                // If it can't be converted to u32, it might be a valid felt252 address representation
-                // For now, accept it if it's a reasonable felt252 value (not zero)
-                // Use a default length check - Bitcoin addresses are typically 26-35 characters
-                26 // Default assumption for valid Bitcoin address
-            }
-        };
+        let addr_len: u32 = btc_address.try_into().unwrap_or(26);
 
         // Validate length is within expected range for Bitcoin addresses (14-74 characters)
         // This covers P2PKH (25-34), P2SH (25-34), and Bech32 (14-74) addresses
@@ -572,12 +564,9 @@ pub mod Bridge {
         bridge_btc_to_token: ContractAddress,
         bridge_token_to_btc: ContractAddress,
         swap_token_to_token: ContractAddress,
-        initiate_bitcoin_deposit: ContractAddress,
-        initiate_bitcoin_withdrawal: ContractAddress,
         send: ContractAddress,
         withdraw: ContractAddress,
         deposit: ContractAddress,
-        rewstarknet_token: ContractAddress
     ) {
         // Validate inputs
         validate_address(admin, 'INVALID_ADMIN');
@@ -588,12 +577,9 @@ pub mod Bridge {
         validate_address(bridge_btc_to_token, Errors::INVALID_BRIDGE_BTC_TO_TOKEN_ADDRESS);
         validate_address(bridge_token_to_btc, Errors::INVALID_BRIDGE_TOKEN_TO_BTC_ADDRESS);
         validate_address(swap_token_to_token, Errors::INVALID_SWAP_TOKEN_TO_TOKEN_ADDRESS);
-        validate_address(initiate_bitcoin_deposit, Errors::INVALID_INITIATE_BITCOIN_DEPOSIT_ADDRESS);
-        validate_address(initiate_bitcoin_withdrawal, Errors::INVALID_INITIATE_BITCOIN_WITHDRAWAL_ADDRESS);
         validate_address(send, Errors::INVALID_SEND_ADDRESS);
         validate_address(withdraw, Errors::INVALID_WITHDRAW_ADDRESS);
         validate_address(deposit, Errors::INVALID_DEPOSIT_ADDRESS);
-        validate_address(rewstarknet_token, 'INVALID_REWSTARKNET_TOKEN');
 
         // Initialize core admin addresses
         self.admin.write(admin);
@@ -606,12 +592,9 @@ pub mod Bridge {
         self.bridge_btc_to_token_address.write(bridge_btc_to_token);
         self.bridge_token_to_btc_address.write(bridge_token_to_btc);
         self.swap_token_to_token_address.write(swap_token_to_token);
-        self.initiate_bitcoin_deposit_address.write(initiate_bitcoin_deposit);
-        self.initiate_bitcoin_withdrawal_address.write(initiate_bitcoin_withdrawal);
         self.send_address.write(send);
         self.withdraw_address.write(withdraw);
         self.deposit_address.write(deposit);
-        self.rewstarknet_token.write(rewstarknet_token);
 
         // Bridge state - start unpaused
         self.bridge_paused.write(false);
@@ -652,6 +635,7 @@ pub mod Bridge {
     /// @param amount: Amount to deposit (must be > 0 and within limits)
     /// @param dst_chain_id: Destination chain ID for cross-chain transfer
     /// @param recipient: Recipient address on destination chain
+    #[external(v0)]
     fn deposit(
         ref self: ContractState,
         token: ContractAddress,
@@ -697,6 +681,7 @@ pub mod Bridge {
     }
 
     // Withdraw: admin releases escrowed tokens on Starknet (e.g., BTC->Starknet inbound handled separately via receive).
+    #[external(v0)]
     fn withdraw(ref self: ContractState, token: ContractAddress, to: ContractAddress, amount: u256) {
         assert_admin(ref self);
         ensure(amount > 0, 'INVALID_AMOUNT');
@@ -755,6 +740,7 @@ pub mod Bridge {
     }
 
     // Send: generic cross-chain message intent (no token transfer)
+    #[external(v0)]
     fn send(ref self: ContractState, dst_chain_id: felt252, to_recipient: felt252, data: felt252) {
         let _caller = get_caller_address();
         self.emit(Event::Sent(Sent { dst_chain_id, to_recipient, data }));
@@ -781,7 +767,7 @@ pub mod Bridge {
             call_data.append(to.into());
             call_data.append(amount.low.into());
             call_data.append(amount.high.into());
-            call_contract_syscall(self.rewstarknet_token.read(), selector!("mint"), call_data.span()).unwrap();
+            call_contract_syscall(self.rewstarknet_token.read(), selector!("mint"), call_data.span()).unwrap_syscall();
         } else {
             // Implement ERC20 token transfer for canonical tokens
             // In production, this would use starknet::call_contract with proper calldata
@@ -801,6 +787,7 @@ pub mod Bridge {
     /// @param min_amount_out: Minimum token output amount
     /// @param to: Recipient address on Starknet
     /// @return swap_id: Unique swap identifier
+    #[external(v0)]
     fn bridge_btc_to_token(
         ref self: ContractState,
         amount: u256,
@@ -870,6 +857,7 @@ pub mod Bridge {
     /// @param btc_address: Bitcoin destination address
     /// @param min_btc_out: Minimum Bitcoin output in satoshis
     /// @return swap_id: Unique swap identifier
+    #[external(v0)]
     fn bridge_token_to_btc(
         ref self: ContractState,
         token_in: ContractAddress,
@@ -931,7 +919,7 @@ pub mod Bridge {
         call_data.append(caller.into());
         call_data.append(amount_in.low.into());
         call_data.append(amount_in.high.into());
-        call_contract_syscall(self.rewstarknet_token.read(), selector!("mint"), call_data.span()).unwrap();
+        call_contract_syscall(self.rewstarknet_token.read(), selector!("mint"), call_data.span()).unwrap_syscall();
 
         swap_id
     }

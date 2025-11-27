@@ -1,7 +1,7 @@
 [sncast.alpha-sepolia]
-account = "emman"
+account = "emmanuel"
 url = "https://starknet-sepolia.public.blastapi.io/rpc/v0_7"
 
 [sncast.alpha-mainnet]
-account = "emman"  
+account = "emmanuel"  
 url = "https://starknet-mainnet.public.blastapi.io/rpc/v0_7"
