@@ -557,7 +557,6 @@ pub mod Bridge {
         ref self: ContractState,
         admin: ContractAddress,
         emergency_admin: ContractAddress,
-        daily_bridge_limit: u256,
         lock: ContractAddress,
         unlock: ContractAddress,
         receive_cross_chain: ContractAddress,
@@ -602,8 +601,6 @@ pub mod Bridge {
         self.pause_timestamp.write(starknet::get_block_timestamp());
 
         // Limits and security - simplified for core bridging
-        self.daily_bridge_limit.write(daily_bridge_limit);
-        self.daily_bridge_used.write(0);
         self.last_reset_timestamp.write(starknet::get_block_timestamp());
 
     }
@@ -1110,19 +1107,6 @@ pub mod Bridge {
     #[external(v0)]
     fn get_emergency_admin(self: @ContractState) -> ContractAddress {
         self.emergency_admin.read()
-    }
-
-    /// Set daily bridge limit (admin only)
-    #[external(v0)]
-    fn set_daily_bridge_limit(ref self: ContractState, limit: u256) {
-        assert_admin(ref self);
-        self.daily_bridge_limit.write(limit);
-    }
-
-    /// Get daily bridge limit
-    #[external(v0)]
-    fn get_daily_bridge_limit(self: @ContractState) -> u256 {
-        self.daily_bridge_limit.read()
     }
 
     /// Get current daily bridge usage
