@@ -9,3 +9,6 @@ mod BTCDepositManager;
 mod OperatorRegistry;
 mod BTCPegOut;
 mod EscapeHatch;
+mod RawBTC;
+mod BtcRelay;
+mod BtcWithdrawalManager;

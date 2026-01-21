@@ -13,3 +13,6 @@ sierra = true
 casm = true
 name = "starknet_bridge"
 path = "src/lib.cairo"
+
+[cairo]
+sierra-replace-ids = true

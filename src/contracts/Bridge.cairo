@@ -22,6 +22,10 @@ pub mod Bridge {
         pub const MAX_TRANSACTIONS_PER_USER: u32 = 100000000; // Maximum transaction history per user
     }
 
+    pub const STRK_TOKEN: felt252 = 0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d;
+
+    pub const BITCOIN_BRIDGE_ADDRESS: felt252 = 0x626331716172307372727237786676e;  // bc1qar0srrr7xfkvy5l643lydnw9re596jnsx03h76 as felt252
+
     // Transaction types for history tracking
     #[derive(Drop, Serde, starknet::Store, Copy)]
     #[allow(starknet::store_no_default_variant)]
@@ -48,6 +52,42 @@ pub mod Bridge {
         recipient: felt252,
         btc_address: felt252,
         swap_id: u256,
+    }
+
+    /// Bridge operation type
+    #[derive(Drop, Serde, starknet::Store, Copy, PartialEq)]
+    #[allow(starknet::store_no_default_variant)]
+    pub enum BridgeOperation {
+        BitcoinToStarknet,
+        StarknetToBitcoin,
+        Conversion,
+    }
+
+    /// Bridge transfer record for audit trail
+    #[derive(Drop, Serde, starknet::Store)]
+    pub struct BridgeTransfer {
+        pub operation_type: BridgeOperation,
+        pub from_address: felt252,
+        pub to_address: felt252,
+        pub token_in: ContractAddress,
+        pub amount_in: u256,
+        pub token_out: ContractAddress,
+        pub amount_out: u256,
+        pub conversion_enabled: bool,
+        pub conversion_rate: u256,
+        pub timestamp: u64,
+        pub bitcoin_tx_hash: felt252,
+        pub starknet_tx_hash: felt252,
+        pub status: u8, // 0=pending, 1=confirmed, 2=failed
+    }
+
+    /// User conversion preference
+    #[derive(Drop, Serde, starknet::Store)]
+    pub struct ConversionPreference {
+        pub user: ContractAddress,
+        pub auto_convert: bool,
+        pub min_conversion_rate: u256,
+        pub max_slippage_bps: u16, // basis points
     }
 
     #[storage]
@@ -82,6 +122,36 @@ pub mod Bridge {
         user_transaction_count: Map<ContractAddress, u32>, // user -> transaction count
         user_transactions: Map<(ContractAddress, u32), TransactionRecord>, // (user, index) -> transaction record
 
+        // ========== rawBTC IMPLEMENTATION (ERC20) ==========
+        /// rawBTC is the canonical Bitcoin representation on Starknet
+        /// 1 rawBTC = 1 satoshi worth on Bitcoin
+        pub rawbtc_total_supply: u256,
+        pub rawbtc_balance: Map<ContractAddress, u256>,
+        pub rawbtc_allowance: Map<(ContractAddress, ContractAddress), u256>,
+
+        // ========== BRIDGE STATE ==========
+        /// Maps Bitcoin tx hash -> confirmed block height
+        pub btc_tx_confirmations: Map<felt252, u32>,
+        /// Maps Bitcoin tx hash -> minted amount on Starknet (prevent double-mint)
+        pub btc_tx_minted: Map<felt252, u256>,
+        /// Maps Starknet withdrawal request -> Bitcoin tx hash (when relayer fulfills)
+        pub starknet_withdrawal_txid: Map<felt252, felt252>,
+
+        // ========== PRICING DATA ==========
+        /// Real-time BTC/STRK exchange rate (in fixed-point: rate * 10^18)
+        pub btc_strk_rate: u256,
+        /// Last update timestamp for pricing
+        pub rate_last_updated: u64,
+        /// Oracle confidence interval (basis points)
+        pub rate_confidence_bps: u16,
+        
+        // ========== USER PREFERENCES ==========
+        pub user_conversion_prefs: Map<ContractAddress, ConversionPreference>,
+        
+        // ========== AUDIT & HISTORY ==========
+        pub transfers: Map<felt252, BridgeTransfer>,
+        pub user_transfer_count: Map<ContractAddress, u32>,
+
         // External contract addresses for operations
         lock_address: ContractAddress,
         unlock_address: ContractAddress,
@@ -97,6 +167,14 @@ pub mod Bridge {
 
         // Rewstarknet token for bridging rewards/replacements
         rewstarknet_token: ContractAddress,
+
+        // ERC20 for rawBTC
+        total_supply: u256,
+        balances: Map<ContractAddress, u256>,
+        allowances: Map<(ContractAddress, ContractAddress), u256>,
+        name: felt252,
+        symbol: felt252,
+        decimals: u8,
 
         // Bridge-specific storage only
     }
@@ -162,6 +240,24 @@ pub mod Bridge {
         src_chain_id: felt252,
         from_sender: felt252,
         data: felt252,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct Transfer {
+        #[key]
+        from: ContractAddress,
+        #[key]
+        to: ContractAddress,
+        value: u256,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct Approval {
+        #[key]
+        owner: ContractAddress,
+        #[key]
+        spender: ContractAddress,
+        value: u256,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -232,7 +328,49 @@ pub mod Bridge {
         unpaused_at: u64,
     }
 
+     // ============================================================
+    // EVENTS
+    // ============================================================
 
+    #[derive(Drop, starknet::Event)]
+    pub struct RawBTCMinted {
+        pub to: ContractAddress,
+        pub amount: u256,
+        pub btc_tx_hash: felt252,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct RawBTCBurned {
+        pub from: ContractAddress,
+        pub amount: u256,
+        pub bitcoin_address: felt252,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct ConversionExecuted {
+        pub user: ContractAddress,
+        pub token_in: ContractAddress,
+        pub amount_in: u256,
+        pub token_out: ContractAddress,
+        pub amount_out: u256,
+        pub rate: u256,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct ConversionPreferenceSet {
+        pub user: ContractAddress,
+        pub auto_convert: bool,
+        pub min_rate: u256,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct PricingUpdated {
+        pub btc_strk_rate: u256,
+        pub timestamp: u64,
+        pub confidence_bps: u16,
+    }
+
+   
 
     #[event]
     #[derive(Drop, starknet::Event)]
@@ -252,6 +390,13 @@ pub mod Bridge {
         BitcoinWithdrawalInitiated: BitcoinWithdrawalInitiated,
         BridgePaused: BridgePaused,
         BridgeUnpaused: BridgeUnpaused,
+        Transfer: Transfer,
+        Approval: Approval,
+        RawBTCMinted: RawBTCMinted,
+        RawBTCBurned: RawBTCBurned,
+        ConversionExecuted: ConversionExecuted,
+        ConversionPreferenceSet: ConversionPreferenceSet,
+        PricingUpdated: PricingUpdated,
     }
 
     // Error constants - organized by category
@@ -504,23 +649,10 @@ pub mod Bridge {
         false
     }
 
-    /// Check if daily bridge limit is exceeded
+    /// Check if daily bridge limit is exceeded (disabled for now)
     fn check_daily_limit(ref self: ContractState, amount: u256) {
-        let current_time = starknet::get_block_timestamp();
-        let last_reset = self.last_reset_timestamp.read();
-
-        // Reset daily counter if 24 hours have passed
-        if current_time >= last_reset + 86400 { // 24 hours in seconds
-            self.daily_bridge_used.write(0);
-            self.last_reset_timestamp.write(current_time);
-        }
-
-        let daily_used = self.daily_bridge_used.read();
-        let daily_limit = self.daily_bridge_limit.read();
-        ensure(daily_used + amount <= daily_limit, 'DAILY_LIMIT_EXCEEDED');
-
-        // Additional rate limiting checks
-        ensure(!is_rate_limit_exceeded(current_time, amount), 'RATE_LIMIT_EXCEEDED');
+        // Daily limit check disabled - allowing all transactions
+        // This function is kept for backward compatibility but does nothing
     }
 
     /// Check if rate limit is exceeded (per-minute limits)
@@ -531,10 +663,10 @@ pub mod Bridge {
         false
     }
 
-    /// Update daily bridge usage
+    /// Update daily bridge usage (disabled - no longer tracking daily usage)
     fn update_daily_usage(ref self: ContractState, amount: u256) {
-        let current_used = self.daily_bridge_used.read();
-        self.daily_bridge_used.write(current_used + amount);
+        // Daily usage tracking disabled
+        // This function is kept for backward compatibility but does nothing
     }
 
     /// Emergency pause function
@@ -594,6 +726,12 @@ pub mod Bridge {
         self.send_address.write(send);
         self.withdraw_address.write(withdraw);
         self.deposit_address.write(deposit);
+
+        // Initialize ERC20 for rawBTC
+        self.name.write('rawBTC');
+        self.symbol.write('rawBTC');
+        self.decimals.write(8);
+        self.total_supply.write(0);
 
         // Bridge state - start unpaused
         self.bridge_paused.write(false);
@@ -655,10 +793,6 @@ pub mod Bridge {
         check_replay_protection(ref self, get_caller_address());
         validate_bridge_security(ref self, amount, token);
 
-
-        // Check daily limits
-        check_daily_limit(ref self, amount);
-
         let caller = get_caller_address();
         let _this = get_contract_address();
 
@@ -710,10 +844,6 @@ pub mod Bridge {
         // Security validations
         check_replay_protection(ref self, get_caller_address());
         validate_bridge_security(ref self, amount, token);
-
-
-        // Check daily limits
-        check_daily_limit(ref self, amount);
 
         let caller = get_caller_address();
 
@@ -806,10 +936,6 @@ pub mod Bridge {
         ensure(to != zero_address, Errors::INVALID_RECIPIENT);
         ensure(min_amount_out > 0, 'INVALID_MIN_AMOUNT');
 
-
-        // Check daily limits
-        check_daily_limit(ref self, amount);
-
         let caller = get_caller_address();
 
         // Generate swap ID using improved cryptographic hash
@@ -872,11 +998,35 @@ pub mod Bridge {
         validate_btc_address(btc_address);
         ensure(min_btc_out > 0, 'INVALID_MIN_BTC_OUT');
 
-
-        // Check daily limits
-        check_daily_limit(ref self, amount_in);
-
         let caller = get_caller_address();
+        let this = get_contract_address();
+
+        // Handle token transfer/burn
+        if token_in == this {
+            // Transfer rawBTC from caller to bridge using transferFrom
+            let mut call_data = ArrayTrait::new();
+            call_data.append(caller.into());
+            call_data.append(this.into());
+            call_data.append(amount_in.low.into());
+            call_data.append(amount_in.high.into());
+            call_contract_syscall(this, selector!("transferFrom"), call_data.span()).unwrap_syscall();
+            // Then burn from bridge balance
+            let balance = self.balances.read(this);
+            self.balances.write(this, balance - amount_in);
+            let total = self.total_supply.read();
+            self.total_supply.write(total - amount_in);
+            self.emit(Event::Transfer(Transfer { from: this, to: 0.try_into().unwrap(), value: amount_in }));
+        } else if token_in == STRK_TOKEN.try_into().unwrap() {
+            // Transfer STRK from caller to bridge
+            let mut call_data = ArrayTrait::new();
+            call_data.append(caller.into());
+            call_data.append(this.into());
+            call_data.append(amount_in.low.into());
+            call_data.append(amount_in.high.into());
+            call_contract_syscall(token_in, selector!("transferFrom"), call_data.span()).unwrap_syscall();
+        } else {
+            ensure(false, 'INVALID_TOKEN_FOR_WITHDRAWAL');
+        }
 
         // Generate swap ID
         let mut hash_input: felt252 = amount_in.low.into() + amount_in.high.into() + btc_address + token_in.into();
@@ -910,13 +1060,6 @@ pub mod Bridge {
             amount_out: min_btc_out,
             to: caller
         }));
-
-        // Mint rewstarknet tokens to the user as reward for bridging
-        let mut call_data = ArrayTrait::new();
-        call_data.append(caller.into());
-        call_data.append(amount_in.low.into());
-        call_data.append(amount_in.high.into());
-        call_contract_syscall(self.rewstarknet_token.read(), selector!("mint"), call_data.span()).unwrap_syscall();
 
         swap_id
     }
@@ -952,10 +1095,6 @@ pub mod Bridge {
         let zero_address: ContractAddress = 0.try_into().unwrap();
         ensure(to != zero_address, Errors::INVALID_RECIPIENT);
         ensure(min_amount_out > 0, 'INVALID_MIN_AMOUNT');
-
-
-        // Check daily limits
-        check_daily_limit(ref self, amount_in);
 
         // For current version, simulate the swap with 0.5% fee
         let fee_amount = amount_in / 200; // 0.5% fee
@@ -1002,8 +1141,6 @@ pub mod Bridge {
         // Generate deposit ID using simple hash
         let deposit_id = u256 { low: amount.low + btc_address.try_into().unwrap_or(0), high: 0 };
 
-        // Check daily limits
-        check_daily_limit(ref self, amount);
         update_daily_usage(ref self, amount);
 
         let caller = get_caller_address();
@@ -1039,8 +1176,6 @@ pub mod Bridge {
         // Generate withdrawal ID using simple hash
         let withdrawal_id = u256 { low: amount.low + btc_address.try_into().unwrap_or(0), high: 0 };
 
-        // Check daily limits
-        check_daily_limit(ref self, amount);
         update_daily_usage(ref self, amount);
 
         let caller = get_caller_address();
@@ -1157,6 +1292,208 @@ pub mod Bridge {
         };
 
         transactions
+    }
+
+    // ERC20 functions for rawBTC
+    #[external(v0)]
+    fn name(self: @ContractState) -> felt252 {
+        self.name.read()
+    }
+
+    #[external(v0)]
+    fn symbol(self: @ContractState) -> felt252 {
+        self.symbol.read()
+    }
+
+    #[external(v0)]
+    fn decimals(self: @ContractState) -> u8 {
+        self.decimals.read()
+    }
+
+    #[external(v0)]
+    fn totalSupply(self: @ContractState) -> u256 {
+        self.total_supply.read()
+    }
+
+    #[external(v0)]
+    fn balanceOf(self: @ContractState, account: ContractAddress) -> u256 {
+        self.balances.read(account)
+    }
+
+    #[external(v0)]
+    fn transfer(ref self: ContractState, to: ContractAddress, amount: u256) -> bool {
+        let caller = get_caller_address();
+        let balance = self.balances.read(caller);
+        ensure(balance >= amount, 'INSUFFICIENT_BALANCE');
+        self.balances.write(caller, balance - amount);
+        let to_balance = self.balances.read(to);
+        self.balances.write(to, to_balance + amount);
+        self.emit(Event::Transfer(Transfer { from: caller, to, value: amount }));
+        true
+    }
+
+    #[external(v0)]
+    fn allowance(self: @ContractState, owner: ContractAddress, spender: ContractAddress) -> u256 {
+        self.allowances.read((owner, spender))
+    }
+
+    #[external(v0)]
+    fn approve(ref self: ContractState, spender: ContractAddress, amount: u256) -> bool {
+        let caller = get_caller_address();
+        self.allowances.write((caller, spender), amount);
+        self.emit(Event::Approval(Approval { owner: caller, spender, value: amount }));
+        true
+    }
+
+    #[external(v0)]
+    fn transferFrom(ref self: ContractState, from: ContractAddress, to: ContractAddress, amount: u256) -> bool {
+        let caller = get_caller_address();
+        let allowance = self.allowances.read((from, caller));
+        ensure(allowance >= amount, 'INSUFFICIENT_ALLOWANCE');
+        let from_balance = self.balances.read(from);
+        ensure(from_balance >= amount, 'INSUFFICIENT_BALANCE');
+        self.allowances.write((from, caller), allowance - amount);
+        self.balances.write(from, from_balance - amount);
+        let to_balance = self.balances.read(to);
+        self.balances.write(to, to_balance + amount);
+        self.emit(Event::Transfer(Transfer { from, to, value: amount }));
+        true
+    }
+
+    // Mint rawBTC (admin only, called after BTC deposit verification)
+    #[external(v0)]
+    fn mint_rawbtc(ref self: ContractState, to: ContractAddress, amount: u256, deposit_id: u256) {
+        assert_admin(ref self);
+        // In production, verify deposit_id is valid and not already processed
+        let balance = self.balances.read(to);
+        self.balances.write(to, balance + amount);
+        let total = self.total_supply.read();
+        self.total_supply.write(total + amount);
+        self.emit(Event::Transfer(Transfer { from: 0.try_into().unwrap(), to, value: amount }));
+    }
+
+    // Burn rawBTC
+    #[external(v0)]
+    fn burn_rawbtc(ref self: ContractState, amount: u256) {
+        let caller = get_caller_address();
+        let balance = self.balances.read(caller);
+        ensure(balance >= amount, 'INSUFFICIENT_BALANCE');
+        self.balances.write(caller, balance - amount);
+        let total = self.total_supply.read();
+        self.total_supply.write(total - amount);
+        self.emit(Event::Transfer(Transfer { from: caller, to: 0.try_into().unwrap(), value: amount }));
+    }
+
+     // ============================================================
+    // PRICING ORACLE INTERFACE
+    // ============================================================
+
+    /// Update BTC/STRK exchange rate from price feed
+    /// In production, this would be called by an authorized oracle
+    /// or integrated with Pragma/RedStone price feeds
+    #[external(v0)]
+    fn update_pricing(
+        ref self: ContractState,
+        btc_strk_rate: u256,  // rate in fixed-point (rate * 10^18)
+        confidence_bps: u16,
+    ) {
+        assert_admin(ref self);
+        assert!(btc_strk_rate > 0, "INVALID_RATE");
+        assert!(confidence_bps < 10000, "INVALID_CONFIDENCE"); // < 100%
+        
+        self.btc_strk_rate.write(btc_strk_rate);
+        self.rate_confidence_bps.write(confidence_bps);
+        self.rate_last_updated.write(starknet::get_block_timestamp());
+        
+        self.emit(Event::PricingUpdated(PricingUpdated {
+            btc_strk_rate,
+            timestamp: starknet::get_block_timestamp(),
+            confidence_bps,
+        }));
+    }
+
+
+// ============================================================
+    // OPTIONAL CONVERSION: BTC -> STRK
+    // ============================================================
+
+    /// User sets conversion preference (OPT-IN)
+    /// If enabled, incoming rawBTC can be auto-converted to STRK
+    /// 
+    /// @param auto_convert: Enable/disable automatic conversion
+    /// @param min_conversion_rate: Reject conversion below this rate
+    /// @param max_slippage_bps: Maximum acceptable slippage in basis points
+    #[external(v0)]
+    fn set_conversion_preference(
+        ref self: ContractState,
+        auto_convert: bool,
+        min_conversion_rate: u256,
+        max_slippage_bps: u16,
+    ) {
+        let user = get_caller_address();
+        assert!(max_slippage_bps < 10000, "INVALID_SLIPPAGE");
+        
+        let pref = ConversionPreference {
+            user,
+            auto_convert,
+            min_conversion_rate,
+            max_slippage_bps,
+        };
+        
+        self.user_conversion_prefs.write(user, pref);
+        
+        self.emit(Event::ConversionPreferenceSet(ConversionPreferenceSet {
+            user,
+            auto_convert,
+            min_rate: min_conversion_rate,
+        }));
+    }
+
+    /// Execute conversion from rawBTC to STRK
+    /// Only callable if user has opted-in to conversion
+    /// 
+    /// @param amount_btc: Amount of rawBTC to convert
+    #[external(v0)]
+    fn convert_rawbtc_to_strk(
+        ref self: ContractState,
+        amount_btc: u256,
+    ) -> u256 {
+        assert_not_paused(@self);
+        
+        let user = get_caller_address();
+        let pref = self.user_conversion_prefs.read(user);
+        assert!(pref.auto_convert, "CONVERSION_NOT_ENABLED");
+        
+        let balance = self.rawbtc_balance.read(user);
+        assert!(balance >= amount_btc, "INSUFFICIENT_BALANCE");
+        
+        let rate = self.btc_strk_rate.read();
+        assert!(rate >= pref.min_conversion_rate, "RATE_TOO_LOW");
+        
+        // Calculate conversion amount: amount_btc * rate / 10^18
+        let amount_strk: u256 = (amount_btc * rate) / 1000000000000000000;
+        
+        // Apply slippage
+        let slippage_amount = (amount_strk * pref.max_slippage_bps.into()) / 10000;
+        let amount_strk_with_slippage = amount_strk - slippage_amount;
+        
+        // BURN rawBTC
+        self.rawbtc_balance.write(user, balance - amount_btc);
+        self.rawbtc_total_supply.write(self.rawbtc_total_supply.read() - amount_btc);
+        
+        // Note: In production, transfer STRK from reserve or mint if needed
+        // For now, emit event for off-chain processing
+        
+        self.emit(Event::ConversionExecuted(ConversionExecuted {
+            user,
+            token_in: get_contract_address(), // rawBTC
+            amount_in: amount_btc,
+            token_out: STRK_TOKEN.try_into().unwrap(),
+            amount_out: amount_strk_with_slippage,
+            rate,
+        }));
+        
+        amount_strk_with_slippage
     }
 
 }

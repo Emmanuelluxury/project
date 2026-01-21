@@ -1,11 +1,23 @@
 #[starknet::contract]
-pub mod BTCDepositManager {
+pub mod BTCDepositManagerV2 {
     use starknet::{ContractAddress, get_caller_address};
     use starknet::storage::{
         Map, StoragePointerReadAccess, StoragePointerWriteAccess,
         StorageMapReadAccess, StorageMapWriteAccess
     };
     use core::integer::u256;
+
+    // Bitcoin Header structure
+    #[derive(Drop, Serde, starknet::Store)]
+    pub struct BitcoinHeader {
+        hash: felt252,
+        previous_block_hash: felt252,
+        merkle_root: felt252,
+        timestamp: u32,
+        bits: u32,
+        nonce: u32,
+        height: u32,
+    }
 
     // Deposit request structure
     #[derive(Drop, Serde, starknet::Store, Copy)]
@@ -40,25 +52,18 @@ pub mod BTCDepositManager {
 
     #[storage]
     struct Storage {
-        // Deposit requests mapping
-        deposits: Map<u256, DepositRequest>, // deposit_id -> DepositRequest
-        // Bitcoin headers contract
+        deposits: Map<u256, DepositRequest>,
         bitcoin_headers_contract: ContractAddress,
-        // SPV verifier contract
         spv_verifier_contract: ContractAddress,
-        // sBTC token contract
         sbtc_contract: ContractAddress,
-        // Deposit counter for generating unique IDs
         deposit_counter: u256,
-        // Minimum deposit amount (in satoshis)
         min_deposit_amount: u256,
-        // Maximum deposit amount (in satoshis)
         max_deposit_amount: u256,
-        // Admin address
-        admin: ContractAddress,
-        // Deposit fee (in basis points)
         deposit_fee_bps: u16,
+        min_confirmations: u32, // ✅ NEW
+        admin: ContractAddress,
     }
+
 
     #[derive(Drop, starknet::Event)]
     struct DepositRequested {
@@ -125,7 +130,8 @@ pub mod BTCDepositManager {
         sbtc_contract: ContractAddress,
         min_deposit_amount: u256,
         max_deposit_amount: u256,
-        deposit_fee_bps: u16
+        deposit_fee_bps: u16,
+        min_confirmations: u32 // ✅ NEW
     ) {
         self.admin.write(admin);
         self.bitcoin_headers_contract.write(bitcoin_headers_contract);
@@ -134,6 +140,7 @@ pub mod BTCDepositManager {
         self.min_deposit_amount.write(min_deposit_amount);
         self.max_deposit_amount.write(max_deposit_amount);
         self.deposit_fee_bps.write(deposit_fee_bps);
+        self.min_confirmations.write(min_confirmations);
     }
 
     #[external(v0)]
@@ -164,7 +171,7 @@ pub mod BTCDepositManager {
         };
 
         // Store deposit request with deposit_id as key
-        self.deposits.write(deposit_id.into(), deposit_request);
+        self.deposits.write(deposit_id, deposit_request);
 
         self.emit(Event::DepositRequested(DepositRequested {
             deposit_id,
@@ -180,84 +187,84 @@ pub mod BTCDepositManager {
 
     #[external(v0)]
     fn confirm_deposit(
-        ref self: ContractState,
-        deposit_id: u256,
-        tx_hash: felt252,
-        block_height: u32,
-        merkle_proof: MerkleProof
-    ) {
-        let mut deposit = self.deposits.read(deposit_id.into());
-        assert(deposit.tx_hash == 0 || deposit.tx_hash == tx_hash, Errors::DEPOSIT_EXISTS);
-        assert(deposit.status == DepositStatus::Pending, Errors::ALREADY_PROCESSED);
+    ref self: ContractState,
+    deposit_id: u256,
+    tx_hash: felt252,
+    block_height: u32,
+    merkle_proof: MerkleProof
+) {
+    let mut deposit = self.deposits.read(deposit_id);
 
-        // Extract values before consuming the struct
-        let merkle_root = merkle_proof.merkle_root;
+    assert(deposit.status == DepositStatus::Pending, Errors::ALREADY_PROCESSED);
+    assert(deposit.tx_hash == 0, Errors::DEPOSIT_EXISTS);
 
-        // Verify SPV proof
-        let spv_verifier = self.spv_verifier_contract.read();
-        let mut spv_dispatcher = ISPVerifierDispatcher {
-            contract_address: spv_verifier
-        };
+    // Store merkle_root before moving merkle_proof
+    let merkle_root = merkle_proof.merkle_root;
 
-        let is_valid = spv_dispatcher.verify_transaction_inclusion(
-            merkle_proof,
-            block_height
-        );
+    // Verify SPV proof
+    let mut spv = ISPVerifierDispatcher {
+        contract_address: self.spv_verifier_contract.read()
+    };
 
-        assert(is_valid, Errors::INVALID_PROOF);
+    let valid = spv.verify_transaction_inclusion(merkle_proof, block_height);
+    assert(valid, Errors::INVALID_PROOF);
 
-        // Update deposit request
-        deposit.tx_hash = tx_hash;
-        deposit.block_height = block_height;
-        deposit.status = DepositStatus::Confirmed;
-        self.deposits.write(deposit_id.into(), deposit);
+    // ✅ Enforce BTC finality
+    let current_btc_height = IBitcoinHeadersDispatcher {
+        contract_address: self.bitcoin_headers_contract.read()
+    }.get_best_height();
 
-        self.emit(Event::DepositConfirmed(DepositConfirmed {
-            tx_hash,
-            block_height,
-            merkle_root,
-        }));
-    }
+    assert(
+        current_btc_height >= block_height + self.min_confirmations.read(),
+        Errors::INVALID_PROOF
+    );
 
-    #[external(v0)]
+    deposit.tx_hash = tx_hash;
+    deposit.block_height = block_height;
+    deposit.status = DepositStatus::Confirmed;
+
+    self.deposits.write(deposit_id, deposit);
+
+    self.emit(Event::DepositConfirmed(DepositConfirmed {
+        tx_hash,
+        block_height,
+        merkle_root,
+    }));
+   }
+
+   #[external(v0)]
     fn mint_deposit(ref self: ContractState, deposit_id: u256) {
-        let mut deposit = self.deposits.read(deposit_id.into());
-        assert(deposit.status == DepositStatus::Confirmed, Errors::DEPOSIT_NOT_FOUND);
-        assert(deposit.tx_hash != 0, Errors::INVALID_PROOF);
+        let mut deposit = self.deposits.read(deposit_id);
 
-        // Calculate fee and mint amount
-        let fee_amount = (deposit.amount * self.deposit_fee_bps.read().into()) / 10000;
-        let actual_mint_amount = deposit.amount - fee_amount;
+        assert(deposit.status == DepositStatus::Confirmed, Errors::ALREADY_PROCESSED);
 
-        // Mint sBTC to recipient
-        let sbtc_contract = self.sbtc_contract.read();
-        let mut sbtc_dispatcher = ISBTCDispatcher {
-            contract_address: sbtc_contract
-        };
+        let fee = (deposit.amount * self.deposit_fee_bps.read().into()) / 10000;
+        let mint_amount = deposit.amount - fee;
 
-        // Mint sBTC tokens to recipient
-        sbtc_dispatcher.mint(deposit.starknet_recipient, actual_mint_amount);
+        ISBTCDispatcher {
+            contract_address: self.sbtc_contract.read()
+        }.mint(deposit.starknet_recipient, mint_amount);
 
-        // Update deposit status
+        // 🔐 LOCK FOREVER
         deposit.status = DepositStatus::Minted;
-        self.deposits.write(deposit_id.into(), deposit);
+        self.deposits.write(deposit_id, deposit);
 
         self.emit(Event::DepositMinted(DepositMinted {
             tx_hash: deposit.tx_hash,
             recipient: deposit.starknet_recipient,
-            amount_minted: actual_mint_amount,
-            fee_deducted: fee_amount,
+            amount_minted: mint_amount,
+            fee_deducted: fee,
         }));
     }
 
     #[external(v0)]
     fn fail_deposit(ref self: ContractState, deposit_id: u256, reason: felt252) {
         self.assert_admin();
-        let mut deposit = self.deposits.read(deposit_id.into());
+        let mut deposit = self.deposits.read(deposit_id);
         assert(deposit.status == DepositStatus::Pending, Errors::ALREADY_PROCESSED);
 
         deposit.status = DepositStatus::Failed;
-        self.deposits.write(deposit_id.into(), deposit);
+        self.deposits.write(deposit_id, deposit);
 
         self.emit(Event::DepositFailed(DepositFailed {
             tx_hash: deposit.tx_hash,
@@ -267,12 +274,12 @@ pub mod BTCDepositManager {
 
     #[external(v0)]
     fn get_deposit(self: @ContractState, deposit_id: u256) -> DepositRequest {
-        self.deposits.read(deposit_id.into())
+        self.deposits.read(deposit_id)
     }
 
     #[external(v0)]
     fn get_deposit_status(self: @ContractState, deposit_id: u256) -> DepositStatus {
-        let deposit = self.deposits.read(deposit_id.into());
+        let deposit = self.deposits.read(deposit_id);
         deposit.status
     }
 
@@ -313,6 +320,18 @@ pub mod BTCDepositManager {
             let admin = self.admin.read();
             assert(caller == admin, Errors::NOT_ADMIN);
         }
+    }
+
+    // Interface for Bitcoin Headers contract
+    #[starknet::interface]
+    trait IBitcoinHeaders<TContractState> {
+        fn submit_header(ref self: TContractState, header: BitcoinHeader) -> felt252;
+        fn get_header(self: @TContractState, height: u32) -> BitcoinHeader;
+        fn get_header_hash(self: @TContractState, height: u32) -> felt252;
+        fn get_best_height(self: @TContractState) -> u32;
+        fn get_merkle_root(self: @TContractState, height: u32) -> felt252;
+        fn set_admin(ref self: TContractState, new_admin: ContractAddress);
+        fn get_admin(self: @TContractState) -> ContractAddress;
     }
 
     // Interface for SPVVerifier contract
